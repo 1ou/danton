@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs;
 use std::fs::File;
+use std::i32::MAX;
 use std::io::{BufReader, BufWriter, Write};
 use std::rc::Rc;
 use std::str;
@@ -72,7 +73,7 @@ impl Ord for TopKDoc {
 impl Eq for TopKDoc {}
 
 pub trait Tokenizer {
-    fn tokenize(&mut self, text: String) -> Vec<(String, i32)>;
+    fn tokenize(self, text: String) -> Vec<(String, i32)>;
 }
 
 struct NaiveTokenizer {}
@@ -84,7 +85,7 @@ impl NaiveTokenizer {
 }
 
 impl Tokenizer for NaiveTokenizer {
-    fn tokenize(&mut self, text: String) -> Vec<(String, i32)> {
+    fn tokenize(self, text: String) -> Vec<(String, i32)> {
         let tokens: Vec<String> = text.split_whitespace().map(|v| { v.to_string() }).collect();
         let mut result = Vec::new();
         for x in tokens {
@@ -107,8 +108,6 @@ fn init() -> std::io::Result<()> {
 }
 
 fn index_documents(documents: Vec<Document>) -> std::io::Result<Segment> {
-    let mut tokenizer = NaiveTokenizer::new();
-
     let mut dict: Trie<char, PostingList> = Trie::new();
     let mut docs = HashMap::new();
     for document in documents {
@@ -117,7 +116,7 @@ fn index_documents(documents: Vec<Document>) -> std::io::Result<Segment> {
         let link_to_doc = Rc::new(document);
 
         docs.insert(doc_id, link_to_doc);
-        let tokens = &tokenizer.tokenize(doc_text);
+        let tokens = NaiveTokenizer::new().tokenize(doc_text);
 
         for x in tokens {
             let token = &x.0;
@@ -161,29 +160,79 @@ fn score_tf_idf(term_freq: i32, total_docs_with_term: i32, total_docs_in_segment
     };
 }
 
-fn search(segment: Segment, query: String) -> Vec<TopKDoc> {
-    let terms = segment.dict.get_value(query.chars());
+struct Iter {
+    doc_id: i64,
+    pos: i32,
+    list: PostingList,
+}
+
+fn search(segment: Segment, query: String, size: i32) -> Vec<TopKDoc> {
+    let mut tokenizer = NaiveTokenizer::new();
+    let tokens = tokenizer.tokenize(query);
+
     let mut top_k = BinaryHeap::new();
+    let mut iterators = Vec::new();
 
-    return if terms.is_none() {
-        vec![]
-    } else {
-        let total_doc_segment = segment.docs.len();
-        let final_terms = terms.unwrap();
-        let total_doc_with_term = final_terms.list.len();
-        for i in 0..final_terms.list.len() {
-            let score = score_tf_idf(final_terms.list[i].freq,
-                                     total_doc_with_term as i32,
-                                     total_doc_segment as i32);
-            top_k.push(TopKDoc { id: final_terms.list[i].doc_id, score: F32(score) });
+    for i in 0..tokens.len() {
+        let terms = segment.dict.get_value(tokens[i].0.chars());
+        if terms.is_some() {
+            let final_terms = terms.unwrap();
+            iterators.push(Iter { doc_id: final_terms.list[0].doc_id, pos: 0, list: final_terms });
         }
+    }
+    let total_doc_segment = segment.docs.len();
+    loop {
+        iterators.sort_by_key(|k| k.doc_id);
+        let current_doc_id = iterators[0].doc_id;
+        let mut doc_score = 0 as f32;
+        let mut hits = 0;
+        let mut end = 0;
+        for i in 0..iterators.len() {
+            let mut pos = iterators[i].pos;
+            if pos == i32::MAX {
+                end += 1;
+                continue;
+            }
 
-        let mut result = Vec::new();
-        while let Some(doc) = top_k.pop() {
-            result.push(doc);
+            while iterators[i].doc_id < current_doc_id && pos + 1 < iterators[i].list.list.len() as i32 {
+                pos += 1;
+                iterators[i].pos = pos;
+                iterators[i].doc_id = iterators[i].list.list[pos as usize].doc_id;
+            }
+            if iterators[i].doc_id == current_doc_id {
+                hits += 1;
+                let term_freq = iterators[i].list.list[pos as usize].freq;
+                let total_doc_with_term = iterators[i].list.list.len();
+                let term_score = score_tf_idf(term_freq,
+                                         total_doc_with_term as i32,
+                                         total_doc_segment as i32);
+                doc_score += term_score;
+                iterators[i].pos += 1;
+                if iterators[i].pos < iterators[i].list.list.len() as i32 {
+                    iterators[i].doc_id = iterators[i].list.list[iterators[i].pos as usize].doc_id;
+                } else {
+                    iterators[i].pos = i32::MAX;
+                }
+            } else {
+                end += 1;
+            }
         }
-        return result;
-    };
+        if hits == iterators.len() {
+            top_k.push(TopKDoc { id: current_doc_id, score: F32(doc_score) });
+            if top_k.len() == size as usize {
+                break;
+            }
+        }
+        if end == iterators.len() {
+            break;
+        }
+    }
+
+    let mut result = Vec::new();
+    while let Some(doc) = top_k.pop() {
+        result.push(doc);
+    }
+    return result;
 }
 
 #[cfg(test)]
@@ -220,15 +269,28 @@ mod tests {
     }
 
     #[test]
-    fn search_success() {
+    fn search_single_token_success() {
         let doc_1 = Document { id: 1, text: "hello this is test".to_string() };
         let doc_2 = Document { id: 2, text: "hello second test test".to_string() };
         let doc_3 = Document { id: 3, text: "hello".to_string() };
         let docs = vec![doc_1, doc_2, doc_3];
         let segment = index_documents(docs).expect("");
-        let found_docs = search(segment, "test".to_string());
+        let found_docs = search(segment, "test".to_string(), 2);
         assert_eq!(found_docs.len(), 2);
         assert_eq!(found_docs[1].id, 1);
+        assert_eq!(found_docs[0].id, 2);
+    }
+
+    #[test]
+    fn search_plural_tokens_success() {
+        let doc_1 = Document { id: 1, text: "hello this is test".to_string() };
+        let doc_2 = Document { id: 2, text: "hello second test test there".to_string() };
+        let doc_3 = Document { id: 3, text: "hello".to_string() };
+        let doc_4 = Document { id: 4, text: "tablecloth is on there".to_string() };
+        let docs = vec![doc_1, doc_2, doc_3, doc_4];
+        let segment = index_documents(docs).expect("");
+        let found_docs = search(segment, "hello there".to_string(), 2);
+        assert_eq!(found_docs.len(), 1);
         assert_eq!(found_docs[0].id, 2);
     }
 }
